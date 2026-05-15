@@ -1,3 +1,12 @@
+## 4.2.1
+Fix concurrent read/write operations causing data loss or a `PathAccessException` on Windows (issue #634).
+
+## 4.2.0
+Fix DPAPI FFI calls for compatibility with `win32` 6.0.0.
+
+## 4.1.0
+Upgrades deprecated member usage of win32.
+
 ## 4.0.0
 - This plugin requires a minimum dart sdk of 3.3.0 or higher and a minimum flutter version of 3.19.0.
 - Migrated to new analyzer and clean-up code.

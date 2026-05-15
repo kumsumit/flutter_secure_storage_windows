@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 
+import 'package:ffi/ffi.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage_platform_interface/flutter_secure_storage_platform_interface.dart';
 import 'package:flutter_secure_storage_windows/src/flutter_secure_storage_windows_ffi.dart'
@@ -12,9 +14,17 @@ import 'package:flutter_secure_storage_windows/src/flutter_secure_storage_window
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
+import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
+import 'package:path_provider_windows/path_provider_windows.dart';
+import 'package:win32/win32.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  // Register the Windows path_provider FFI implementation so that
+  // getApplicationSupportDirectory() works in flutter test without a
+  // full app plugin registrant.
+  PathProviderPlatform.instance = PathProviderWindows();
 
   FutureOr<void> cleanUpFiles() async {
     // Clean up current & legacy files.
@@ -299,6 +309,78 @@ void main() {
         );
       }),
     );
+
+    test(
+      'concurrent writes preserve all entries',
+      () => withFfi(() async {
+        // Without a lock the read-modify-write sequences interleave: every
+        // concurrent write loads the same snapshot, sets its key, and saves,
+        // so only the last save survives and all other keys are lost.
+        final target = createTarget();
+        final options = createOptions();
+
+        const count = 10;
+        await Future.wait([
+          for (var i = 0; i < count; i++)
+            target.write(key: 'KEY_$i', value: 'VALUE_$i', options: options),
+        ]);
+
+        final result = await target.readAll(options: options);
+        expect(result.length, count);
+        for (var i = 0; i < count; i++) {
+          expect(result['KEY_$i'], 'VALUE_$i');
+        }
+      }),
+    );
+
+    test(
+      'concurrent deleteAll and writes do not corrupt storage',
+      () => withFfi(() async {
+        // deleteAll without a lock races with writes: clear() deletes the file
+        // while a concurrent write still has it open, producing
+        // PathAccessException.
+        final target = createTarget();
+        final options = createOptions();
+
+        await Future.wait([
+          target.deleteAll(options: options),
+          for (var i = 0; i < 5; i++)
+            target.write(key: 'KEY_$i', value: 'VALUE_$i', options: options),
+        ]);
+
+        // Storage must be in a consistent, readable state after the race.
+        await expectLater(
+          target.readAll(options: options),
+          completes,
+        );
+      }),
+    );
+
+    test(
+      'concurrent containsKey and writes return consistent results',
+      () => withFfi(() async {
+        // containsKey without a lock loads the file while a concurrent write
+        // is mid-save, potentially reading a partially written file.
+        final target = createTarget();
+        final options = createOptions();
+
+        await target.write(key: 'EXISTING', value: 'v', options: options);
+
+        await Future.wait([
+          for (var i = 0; i < 5; i++)
+            target.write(key: 'KEY_$i', value: 'VALUE_$i', options: options),
+          for (var i = 0; i < 5; i++)
+            target.containsKey(key: 'EXISTING', options: options),
+        ]);
+
+        // All writes must have completed and storage must be readable.
+        final result = await target.readAll(options: options);
+        expect(result['EXISTING'], 'v');
+        for (var i = 0; i < 5; i++) {
+          expect(result['KEY_$i'], 'VALUE_$i');
+        }
+      }),
+    );
   });
 
   // These cases depend on 'Basic cases' are passed corrrectly.
@@ -450,7 +532,7 @@ void main() {
               readCalled++;
               return deleteAllCalled > 0
                   ? null
-                  : (call.arguments as Map<String, dynamic>)['key'] == oldKey
+                  : (call.arguments as Map<Object?, Object?>)['key'] == oldKey
                       ? oldValue
                       : null;
             case 'readAll':
@@ -742,7 +824,7 @@ void main() {
             case 'containsKey':
               containsKeyCalled++;
               return deleteCalled > 0 &&
-                  (call.arguments as Map<String, dynamic>)['key'] == key;
+                  (call.arguments as Map<Object?, Object?>)['key'] == key;
             case 'delete':
               deleteCalled++;
               return null;
@@ -779,7 +861,7 @@ void main() {
           switch (call.method) {
             case 'containsKey':
               containsKeyCalled++;
-              return (call.arguments as Map<String, dynamic>)['key'] == key;
+              return (call.arguments as Map<Object?, Object?>)['key'] == key;
             default:
               fail('Unexpected method call: ${call.method}');
           }
@@ -1009,12 +1091,65 @@ void main() {
     );
   });
 
+  group('Lock error isolation', () {
+    test(
+      'failed write does not poison subsequent writes',
+      () => withFfi(() async {
+        final realStorage = ffi.DpapiJsonFileMapStorage();
+
+        // Wraps real storage and throws on the second load call.
+        final faultyStorage = _FaultyMapStorage(
+          realStorage,
+          failOnLoadCall: 2,
+        );
+
+        final target = ffi.createFlutterSecureStorageWindows(
+          MethodChannelFlutterSecureStorage(),
+          faultyStorage,
+        );
+
+        TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+          const MethodChannel('plugins.it_nomads.com/flutter_secure_storage'),
+          (call) async => null,
+        );
+
+        final options = {'useBackwardCompatibility': 'false'};
+
+        await target.write(key: 'KEY1', value: 'VALUE1', options: options);
+
+        await expectLater(
+          target.write(key: 'KEY2', value: 'VALUE2', options: options),
+          throwsA(isA<StateError>()),
+        );
+
+        // Lock must still be functional after the failure.
+        await target.write(key: 'KEY3', value: 'VALUE3', options: options);
+
+        final result = await target.readAll(options: options);
+        expect(result['KEY1'], 'VALUE1');
+        expect(result['KEY3'], 'VALUE3');
+        expect(result.containsKey('KEY2'), isFalse);
+      }),
+    );
+  });
+
   group('Stub does not work at all', () {
     test(
       'constructor',
       () async {
         expect(
           stub.FlutterSecureStorageWindows.new,
+          throwsAssertionError,
+        );
+      },
+    );
+
+    test(
+      'registerWith throws AssertionError',
+      () async {
+        expect(
+          stub.FlutterSecureStorageWindows.registerWith,
           throwsAssertionError,
         );
       },
@@ -1137,6 +1272,181 @@ void main() {
       expect(await target.containsKey(key: key2, options: options), isFalse);
     });
   });
+
+  group('FFI registerWith', () {
+    test(
+      'registerWith sets FlutterSecureStoragePlatform.instance',
+      () => withFfi(() {
+        ffi.FlutterSecureStorageWindows.registerWith();
+        expect(
+          FlutterSecureStoragePlatform.instance,
+          isA<ffi.FlutterSecureStorageWindows>(),
+        );
+      }),
+    );
+  });
+
+  group('DpapiJsonFileMapStorage error paths', () {
+    Future<File> storageFile() async {
+      final dir = await getApplicationSupportDirectory();
+      return File(path.join(dir.path, encryptedJsonFileName));
+    }
+
+    test(
+      'load - throws WindowsException for corrupted (non-DPAPI) file content',
+      () => withFfi(() async {
+        final file = await storageFile();
+        try {
+          await file.create(recursive: true);
+          // Write raw garbage bytes — CryptUnprotectData will fail.
+          await file.writeAsBytes(
+            Uint8List.fromList([0x00, 0x01, 0x02, 0x03, 0x04]),
+            flush: true,
+          );
+
+          final storage = DpapiJsonFileMapStorage();
+          await expectLater(
+            storage.load({}),
+            throwsA(isA<WindowsException>()),
+          );
+          // load() deletes the corrupt file on WindowsException.
+          expect(file.existsSync(), isFalse);
+        } finally {
+          if (file.existsSync()) await file.delete();
+        }
+      }),
+    );
+
+    test(
+      'load - throws FormatException for DPAPI-encrypted invalid UTF-8 bytes',
+      () => withFfi(() async {
+        final file = await storageFile();
+        try {
+          await file.create(recursive: true);
+          // Encrypt raw bytes that are not valid UTF-8 — CryptUnprotectData
+          // decrypts them successfully, but utf8.decoder.convert throws.
+          await file.writeAsBytes(
+            _dpApiEncrypt(Uint8List.fromList([0xFF, 0xFE, 0x00])),
+            flush: true,
+          );
+
+          final storage = DpapiJsonFileMapStorage();
+          await expectLater(storage.load({}), throwsFormatException);
+          // load() deletes the corrupt file on FormatException.
+          expect(file.existsSync(), isFalse);
+        } finally {
+          if (file.existsSync()) await file.delete();
+        }
+      }),
+    );
+
+    test(
+      'load - throws FormatException for DPAPI-encrypted invalid JSON',
+      () => withFfi(() async {
+        final file = await storageFile();
+        try {
+          await file.create(recursive: true);
+          await file.writeAsBytes(
+            _dpApiEncrypt(utf8.encode('not-valid-json')),
+            flush: true,
+          );
+
+          final storage = DpapiJsonFileMapStorage();
+          await expectLater(storage.load({}), throwsFormatException);
+          // load() deletes the corrupt file on FormatException.
+          expect(file.existsSync(), isFalse);
+        } finally {
+          if (file.existsSync()) await file.delete();
+        }
+      }),
+    );
+
+    test(
+      'load - throws FormatException when JSON root is not a Map',
+      () => withFfi(() async {
+        final file = await storageFile();
+        try {
+          await file.create(recursive: true);
+          // Encrypt a JSON array — decrypts fine but is not a Map.
+          await file.writeAsBytes(
+            _dpApiEncrypt(utf8.encode('[1, 2, 3]')),
+            flush: true,
+          );
+
+          final storage = DpapiJsonFileMapStorage();
+          await expectLater(storage.load({}), throwsFormatException);
+          // load() deletes the corrupt file on the non-Map check.
+          expect(file.existsSync(), isFalse);
+        } finally {
+          if (file.existsSync()) await file.delete();
+        }
+      }),
+    );
+  });
+}
+
+/// Encrypts [data] with Windows DPAPI (CryptProtectData).
+///
+/// Used in tests to create files with controlled encrypted content so that
+/// specific error paths inside [DpapiJsonFileMapStorage.load] can be reached.
+Uint8List _dpApiEncrypt(Uint8List data) {
+  return using((alloc) {
+    final pData = alloc<Uint8>(data.length);
+    pData.asTypedList(data.length).setAll(0, data);
+
+    final plainBlob =
+        alloc.allocate<CRYPT_INTEGER_BLOB>(sizeOf<CRYPT_INTEGER_BLOB>());
+    plainBlob.ref.cbData = data.length;
+    plainBlob.ref.pbData = pData;
+
+    final encBlob =
+        alloc.allocate<CRYPT_INTEGER_BLOB>(sizeOf<CRYPT_INTEGER_BLOB>());
+    final Win32Result(value: isProtected) = CryptProtectData(
+      plainBlob,
+      null,
+      null,
+      null,
+      0,
+      encBlob,
+    );
+    if (!isProtected) {
+      throw StateError('_dpApiEncrypt: CryptProtectData failed');
+    }
+
+    try {
+      return Uint8List.fromList(
+        encBlob.ref.pbData.asTypedList(encBlob.ref.cbData),
+      );
+    } finally {
+      LocalFree(HLOCAL(encBlob.ref.pbData.cast()));
+    }
+  });
+}
+
+/// Delegates to [_delegate] but throws [StateError] on the [failOnLoadCall]-th
+/// call to [load], to exercise lock error-isolation behaviour.
+class _FaultyMapStorage extends ffi.MapStorage {
+  _FaultyMapStorage(this._delegate, {required this.failOnLoadCall});
+
+  final ffi.MapStorage _delegate;
+  final int failOnLoadCall;
+  var _loadCount = 0;
+
+  @override
+  FutureOr<Map<String, String>> load(Map<String, String> options) {
+    _loadCount++;
+    if (_loadCount == failOnLoadCall) {
+      throw StateError('simulated load failure');
+    }
+    return _delegate.load(options);
+  }
+
+  @override
+  FutureOr<void> save(Map<String, String> data, Map<String, String> options) =>
+      _delegate.save(data, options);
+
+  @override
+  FutureOr<void> clear(Map<String, String> options) => _delegate.clear(options);
 }
 
 bool canTest() {
